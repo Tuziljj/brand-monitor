@@ -3,7 +3,7 @@ name: 魔形智能舆情监控
 on:
   # 每30分钟运行一次（UTC时间）
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/30 * * * *'
 
   # 允许手动触发
   workflow_dispatch:
