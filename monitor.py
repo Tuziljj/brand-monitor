@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 品牌舆情监控脚本 - 魔形智能
-监控关键词：魔形智能、徐凌杰、金琛、Token超级工厂
-数据来源：36氪、虎嗅、微博、B站、百度新闻等RSS源
+混合抓取策略：搜索引擎 + 社交媒体API + 垂直搜索
+覆盖：百度、搜狗微信、B站、搜狗搜索 等国内主流平台
 推送方式：飞书机器人富文本卡片
 """
 
@@ -12,45 +12,19 @@ import re
 import sys
 import json
 import time
+import hashlib
 import logging
-from datetime import datetime
-from urllib.parse import urlparse
-from typing import Optional
-
 import requests
-import feedparser
+from datetime import datetime
+from urllib.parse import quote, unquote, urljoin
+from typing import Optional, List, Dict, Any
+
+from bs4 import BeautifulSoup
 
 # ==================== 配置区域 ====================
 
 # 监控关键词
 KEYWORDS = ["魔形智能", "徐凌杰", "金琛", "Token超级工厂"]
-
-# RSS源列表（硬编码，方便后续手动添加/删除）
-RSS_SOURCES = [
-    # 新闻/资讯类 - 魔形智能
-    "https://rsshub.app/36kr/search/article/%E9%AD%94%E5%BD%A2%E6%99%BA%E8%83%BD",
-    "https://rsshub.app/huxiu/search/%E9%AD%94%E5%BD%A2%E6%99%BA%E8%83%BD",
-    "https://rsshub.app/sspai/search/%E9%AD%94%E5%BD%A2%E6%99%BA%E8%83%BD",
-    "https://rsshub.app/jiemian/search/%E9%AD%94%E5%BD%A2%E6%99%BA%E8%83%BD",
-    "https://rsshub.app/baidu/news/%E9%AD%94%E5%BD%A2%E6%99%BA%E8%83%BD",
-    "https://rsshub.app/ithome/search/%E9%AD%94%E5%BD%A2%E6%99%BA%E8%83%BD",
-    "https://rsshub.app/thepaper/search/%E9%AD%94%E5%BD%A2%E6%99%BA%E8%83%BD",
-    # 社交媒体类
-    "https://rsshub.app/weibo/keyword/%E9%AD%94%E5%BD%A2%E6%99%BA%E8%83%BD",
-    "https://rsshub.app/weibo/keyword/Token%E8%B6%85%E7%BA%A7%E5%B7%A5%E5%8E%82",
-    "https://rsshub.app/bilibili/vsearch/%E9%AD%94%E5%BD%A2%E6%99%BA%E8%83%BD",
-    # 高管个人舆情 - 徐凌杰
-    "https://rsshub.app/36kr/search/article/%E5%BE%90%E5%87%8C%E6%9D%B0",
-    "https://rsshub.app/weibo/keyword/%E5%BE%90%E5%87%8C%E6%9D%B0",
-    "https://rsshub.app/baidu/news/%E5%BE%90%E5%87%8C%E6%9D%B0",
-]
-
-# RSSHub 备用实例列表（主实例失败时依次尝试）
-MIRROR_SITES = [
-    "https://rsshub.rssforever.com",
-    "https://rsshub.pseudoyu.com",
-    "https://rsshub.fly.dev",
-]
 
 # 请求超时时间（秒）
 REQUEST_TIMEOUT = 15
@@ -60,6 +34,15 @@ HISTORY_FILE = "history.json"
 
 # 飞书 Webhook 环境变量名
 FEISHU_WEBHOOK_ENV = "FEISHU_WEBHOOK"
+
+# 请求头模板
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
+}
 
 # ==================== 日志配置 ====================
 
@@ -73,85 +56,19 @@ logger = logging.getLogger(__name__)
 # ==================== 工具函数 ====================
 
 
-def get_mirror_url(original_url: str, mirror_base: str) -> str:
-    """将原始URL的域名替换为备用实例域名"""
-    parsed = urlparse(original_url)
-    mirror_parsed = urlparse(mirror_base)
-    # 替换协议和域名，保留路径和查询参数
-    new_url = original_url.replace(
-        f"{parsed.scheme}://{parsed.netloc}",
-        f"{mirror_parsed.scheme}://{mirror_parsed.netloc}"
-    )
-    return new_url
+def clean_html(text: str) -> str:
+    """清除HTML标签和转义字符"""
+    if not text:
+        return ""
+    text = re.sub(r'<[^>]+>', '', text)
+    text = text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+    text = text.replace('&quot;', '"').replace('&#39;', "'")
+    text = text.replace('&nbsp;', ' ')
+    text = text.strip()
+    return text
 
 
-def extract_source_name(url: str) -> str:
-    """从RSS URL自动识别来源平台名称"""
-    url_lower = url.lower()
-
-    # 按优先级匹配
-    source_map = {
-        "36kr": "36氪",
-        "huxiu": "虎嗅",
-        "sspai": "少数派",
-        "jiemian": "界面新闻",
-        "baidu": "百度新闻",
-        "ithome": "IT之家",
-        "thepaper": "澎湃新闻",
-        "weibo": "微博",
-        "bilibili": "B站",
-    }
-
-    for key, name in source_map.items():
-        if key in url_lower:
-            return name
-
-    # 兜底：返回域名
-    parsed = urlparse(url)
-    return parsed.netloc
-
-
-def format_time(dt: Optional[datetime]) -> str:
-    """格式化时间为可读字符串"""
-    if dt is None:
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def parse_pub_date(entry) -> Optional[datetime]:
-    """从RSS条目中解析发布时间"""
-    # 尝试多个可能的字段
-    for field in ["published_parsed", "updated_parsed", "created_parsed"]:
-        parsed_time = getattr(entry, field, None)
-        if parsed_time:
-            try:
-                return datetime(*parsed_time[:6])
-            except (TypeError, ValueError):
-                continue
-
-    # 尝试解析字符串格式
-    for field in ["published", "updated", "created", "pubDate"]:
-        date_str = getattr(entry, field, None)
-        if date_str:
-            # 尝试多种格式
-            formats = [
-                "%a, %d %b %Y %H:%M:%S %z",
-                "%a, %d %b %Y %H:%M:%S %Z",
-                "%Y-%m-%dT%H:%M:%S%z",
-                "%Y-%m-%dT%H:%M:%SZ",
-                "%Y-%m-%d %H:%M:%S",
-                "%Y/%m/%d %H:%M:%S",
-            ]
-            for fmt in formats:
-                try:
-                    return datetime.strptime(date_str, fmt)
-                except ValueError:
-                    continue
-
-    return None
-
-
-def find_matched_keywords(text: str) -> list:
+def find_matched_keywords(text: str) -> List[str]:
     """检查文本中命中了哪些关键词，返回命中的关键词列表"""
     if not text:
         return []
@@ -163,64 +80,388 @@ def find_matched_keywords(text: str) -> list:
     return matched
 
 
-# ==================== RSS 抓取 ====================
+def dedup_key(url: str, title: str) -> str:
+    """生成去重key"""
+    key = f"{url}|{title[:40]}"
+    return hashlib.md5(key.encode()).hexdigest()
 
 
-def fetch_rss_with_fallback(url: str) -> Optional[dict]:
-    """
-    抓取RSS源，支持备用实例自动切换
-    先尝试主地址，失败则依次尝试备用实例
-    """
-    urls_to_try = [url]
-
-    # 生成备用URL
-    for mirror in MIRROR_SITES:
-        urls_to_try.append(get_mirror_url(url, mirror))
-
-    last_error = None
-
-    for try_url in urls_to_try:
+def format_pub_time(ts: Any) -> str:
+    """格式化发布时间"""
+    if isinstance(ts, (int, float)) and ts > 1000000000:
         try:
-            logger.info(f"正在抓取: {try_url}")
-            feed = feedparser.parse(try_url, request_headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "application/rss+xml, application/xml, text/xml",
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        except (OSError, ValueError, OverflowError):
+            pass
+    if isinstance(ts, str) and ts:
+        return ts
+    return ""
+
+
+def http_get(url: str, params: dict = None, extra_headers: dict = None,
+             timeout: int = None, session: requests.Session = None) -> Optional[requests.Response]:
+    """发送HTTP GET请求"""
+    headers = dict(HEADERS)
+    if extra_headers:
+        headers.update(extra_headers)
+    
+    req_session = session or requests
+    try:
+        resp = req_session.get(url, params=params, headers=headers,
+                               timeout=timeout or REQUEST_TIMEOUT)
+        return resp
+    except requests.exceptions.Timeout:
+        logger.warning(f"请求超时: {url}")
+    except requests.exceptions.ConnectionError:
+        logger.warning(f"连接失败: {url}")
+    except Exception as e:
+        logger.warning(f"请求异常: {url} - {e}")
+    return None
+
+
+# ==================== 数据源抓取函数 ====================
+
+
+def fetch_baidu_news(keyword: str) -> List[Dict]:
+    """
+    抓取百度新闻搜索结果
+    需要先访问百度首页获取Cookie，再搜索
+    """
+    session = requests.Session()
+    
+    # 第一步：访问百度首页获取Cookie
+    home = http_get("https://www.baidu.com/", session=session, timeout=10)
+    if not home:
+        return []
+    time.sleep(1)
+    
+    # 第二步：搜索新闻
+    resp = http_get(
+        "https://www.baidu.com/s",
+        params={"wd": keyword, "tn": "news", "rn": "20"},
+        extra_headers={"Referer": "https://www.baidu.com/"},
+        session=session,
+    )
+    if not resp or resp.status_code != 200 or len(resp.text) < 5000:
+        logger.debug(f"[百度新闻] 响应异常: status={resp.status_code if resp else 'None'}, len={len(resp.text) if resp else 0}")
+        return []
+
+    results = []
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    
+    # 百度新闻结果在 div.result-op 或 div.c-container 中
+    divs = soup.find_all('div', class_=re.compile(r'result-op|c-container'))
+    
+    for div in divs:
+        try:
+            title_tag = div.select_one('h3 a')
+            if not title_tag:
+                continue
+            title = clean_html(title_tag.get_text(strip=True))
+            href = title_tag.get('href', '')
+
+            if not title or len(title) < 5 or not href:
+                continue
+            # 过滤无关内容
+            if any(x in title for x in ['', '登录', '注册', '习近平', '总书记']):
+                continue
+
+            summary_tag = div.select_one('.content-right_8Zs40, .c-color-text, .content-right')
+            summary = clean_html(summary_tag.get_text(strip=True)) if summary_tag else ''
+
+            source_tag = div.select_one('.c-color-gray, .c-gap-right')
+            source_info = source_tag.get_text(strip=True) if source_tag else ''
+
+            # 提取来源名
+            source_name = "百度新闻"
+            if '·' in source_info:
+                parts = source_info.split('·')
+                if len(parts) >= 2:
+                    source_name = parts[0].strip()
+
+            results.append({
+                "title": title,
+                "url": href if href.startswith('http') else f"https://www.baidu.com{href}",
+                "summary": summary,
+                "source": source_name or "百度新闻",
+                "pub_time": source_info,
+                "keyword": keyword,
             })
-
-            # 检查是否有解析错误
-            if hasattr(feed, 'bozo') and feed.bozo:
-                if feed.entries:
-                    # 有解析警告但有内容，继续处理
-                    logger.warning(f"RSS解析警告（但有内容）: {try_url} - {feed.bozo_exception}")
-                else:
-                    raise Exception(f"RSS解析失败: {feed.bozo_exception}")
-
-            if not feed.entries:
-                logger.warning(f"RSS源无内容: {try_url}")
-                return None
-
-            logger.info(f"成功获取 {len(feed.entries)} 条: {try_url}")
-            return {
-                "url": try_url,
-                "entries": feed.entries,
-                "source_name": extract_source_name(try_url),
-            }
-
         except Exception as e:
-            last_error = e
-            logger.warning(f"抓取失败，尝试下一个: {try_url} - {e}")
+            logger.debug(f"解析百度新闻条目异常: {e}")
             continue
 
-    # 所有实例都失败
-    logger.error(f"所有实例均失败: {url} - 最后错误: {last_error}")
-    return None
+    logger.info(f"[百度新闻] '{keyword}' 获取 {len(results)} 条")
+    return results
+
+
+def fetch_baidu_web(keyword: str) -> List[Dict]:
+    """
+    抓取百度搜索网页结果
+    """
+    session = requests.Session()
+    
+    # 先访问首页
+    home = http_get("https://www.baidu.com/", session=session, timeout=10)
+    if not home:
+        return []
+    time.sleep(1)
+    
+    resp = http_get(
+        "https://www.baidu.com/s",
+        params={"wd": keyword, "rn": "20"},
+        extra_headers={"Referer": "https://www.baidu.com/"},
+        session=session,
+    )
+    if not resp or resp.status_code != 200 or len(resp.text) < 5000:
+        return []
+
+    results = []
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    
+    divs = soup.find_all('div', class_=re.compile(r'result-op|c-container'))
+    
+    for div in divs:
+        try:
+            title_tag = div.select_one('h3 a')
+            if not title_tag:
+                continue
+            title = clean_html(title_tag.get_text(strip=True))
+            href = title_tag.get('href', '')
+
+            if not title or len(title) < 5 or not href:
+                continue
+            if any(x in title for x in ['', '登录', '注册', '习近平', '总书记']):
+                continue
+
+            abstract_tag = div.select_one('.c-abstract, .content-right_8Zs40, .c-color-text')
+            summary = clean_html(abstract_tag.get_text(strip=True)) if abstract_tag else ''
+
+            cite_tag = div.select_one('cite, .c-showurl')
+            show_url = cite_tag.get_text(strip=True) if cite_tag else ''
+
+            results.append({
+                "title": title,
+                "url": href if href.startswith('http') else f"https://www.baidu.com{href}",
+                "summary": summary,
+                "source": "百度搜索",
+                "pub_time": show_url,
+                "keyword": keyword,
+            })
+        except Exception as e:
+            logger.debug(f"解析百度搜索条目异常: {e}")
+            continue
+
+    logger.info(f"[百度搜索] '{keyword}' 获取 {len(results)} 条")
+    return results
+
+
+def fetch_wechat_sogou(keyword: str) -> List[Dict]:
+    """
+    抓取搜狗微信搜索结果（公众号文章）
+    URL: https://weixin.sogou.com/weixin?type=2&query=KEYWORD
+    """
+    resp = http_get(
+        "https://weixin.sogou.com/weixin",
+        params={"type": "2", "query": keyword},
+        extra_headers={"Referer": "https://weixin.sogou.com/"},
+    )
+    if not resp or resp.status_code != 200:
+        return []
+
+    results = []
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    items = soup.select('.news-list li')
+
+    for item in items:
+        try:
+            title_tag = item.select_one('h3 a')
+            if not title_tag:
+                continue
+            title = clean_html(title_tag.get_text(strip=True))
+            href = title_tag.get('href', '')
+            if not title or not href:
+                continue
+
+            if href.startswith('/'):
+                href = f"https://weixin.sogou.com{href}"
+            elif not href.startswith('http'):
+                href = f"https://weixin.sogou.com/{href}"
+
+            summary_tag = item.select_one('p.txt-info, .txt-info, p')
+            summary = clean_html(summary_tag.get_text(strip=True)) if summary_tag else ''
+
+            source_tag = item.select_one('.account, .s-p a')
+            account = source_tag.get_text(strip=True) if source_tag else ''
+
+            # 时间
+            time_tag = item.select_one('.s2 script, .time, .s-p')
+            pub_time = ''
+            if time_tag:
+                time_text = str(time_tag.string or '')
+                time_match = re.search(r"timeConvert\('(\d+)'\)", time_text)
+                if time_match:
+                    try:
+                        ts = int(time_match.group(1))
+                        pub_time = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+                    except (ValueError, OSError):
+                        pass
+
+            results.append({
+                "title": title,
+                "url": href,
+                "summary": summary,
+                "source": f"微信公众号-{account}" if account else "微信公众号",
+                "pub_time": pub_time,
+                "keyword": keyword,
+            })
+        except Exception as e:
+            logger.debug(f"解析搜狗微信条目异常: {e}")
+            continue
+
+    logger.info(f"[搜狗微信] '{keyword}' 获取 {len(results)} 条")
+    return results
+
+
+def fetch_bilibili(keyword: str) -> List[Dict]:
+    """
+    抓取B站视频搜索结果
+    API: https://api.bilibili.com/x/web-interface/search/type
+    """
+    resp = http_get(
+        "https://api.bilibili.com/x/web-interface/search/type",
+        params={
+            "keyword": keyword,
+            "search_type": "video",
+            "page": 1,
+            "pagesize": 20,
+        },
+        extra_headers={
+            "Referer": "https://search.bilibili.com/",
+            "Accept": "application/json, text/plain, */*",
+        },
+    )
+    if not resp or resp.status_code != 200:
+        return []
+
+    results = []
+    try:
+        data = resp.json()
+        if data.get("code") != 0:
+            logger.warning(f"[B站] API错误: {data.get('message', 'unknown')}")
+            return []
+
+        items = data.get("data", {}).get("result", [])
+        for item in items:
+            try:
+                title = clean_html(item.get("title", ""))
+                bvid = item.get("bvid", "")
+                if not title or not bvid:
+                    continue
+
+                description = item.get("description", "")
+                author = item.get("author", "")
+                pubdate_ts = item.get("pubdate", 0)
+
+                results.append({
+                    "title": title,
+                    "url": f"https://www.bilibili.com/video/{bvid}",
+                    "summary": description,
+                    "source": f"B站-{author}" if author else "B站",
+                    "pub_time": format_pub_time(pubdate_ts),
+                    "keyword": keyword,
+                })
+            except Exception as e:
+                logger.debug(f"解析B站条目异常: {e}")
+                continue
+
+    except Exception as e:
+        logger.warning(f"[B站] JSON解析异常: {e}")
+
+    logger.info(f"[B站] '{keyword}' 获取 {len(results)} 条")
+    return results
+
+
+def fetch_sogou(keyword: str) -> List[Dict]:
+    """
+    抓取搜狗网页搜索结果
+    URL: https://www.sogou.com/web?query=KEYWORD
+    """
+    resp = http_get(
+        "https://www.sogou.com/web",
+        params={"query": keyword, "page": "1"},
+        extra_headers={"Referer": "https://www.sogou.com/"},
+    )
+    if not resp or resp.status_code != 200:
+        return []
+
+    results = []
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    items = soup.select('.vrwrap, .rb')
+
+    for item in items:
+        try:
+            title_tag = item.select_one('h3 a, h3.vr-title a')
+            if not title_tag:
+                continue
+            title = clean_html(title_tag.get_text(strip=True))
+            href = title_tag.get('href', '')
+            if not title or len(title) < 5 or not href:
+                continue
+
+            summary_tag = item.select_one('.str-text, .vr-brief, .abstract')
+            summary = clean_html(summary_tag.get_text(strip=True)) if summary_tag else ''
+
+            cite_tag = item.select_one('.citeurl, cite')
+            cite = cite_tag.get_text(strip=True) if cite_tag else ''
+
+            results.append({
+                "title": title,
+                "url": href if href.startswith('http') else f"https://www.sogou.com{href}",
+                "summary": summary,
+                "source": "搜狗搜索",
+                "pub_time": cite,
+                "keyword": keyword,
+            })
+        except Exception as e:
+            logger.debug(f"解析搜狗条目异常: {e}")
+            continue
+
+    logger.info(f"[搜狗搜索] '{keyword}' 获取 {len(results)} 条")
+    return results
+
+
+# ==================== 数据源注册表 ====================
+
+# 数据源配置：名称、抓取函数、要搜索的关键词列表
+DATA_SOURCES = [
+    # 百度新闻搜索 - 核心来源
+    {"name": "百度新闻", "fetcher": fetch_baidu_news,
+     "keywords": ["魔形智能", "徐凌杰", "Token超级工厂"], "delay": 3},
+
+    # 百度搜索（网页）- 补充
+    {"name": "百度搜索", "fetcher": fetch_baidu_web,
+     "keywords": ["魔形智能", "徐凌杰", "金琛", "Token超级工厂"], "delay": 3},
+
+    # 搜狗微信搜索 - 公众号文章
+    {"name": "搜狗微信", "fetcher": fetch_wechat_sogou,
+     "keywords": ["魔形智能", "徐凌杰", "Token超级工厂"], "delay": 2},
+
+    # B站视频搜索
+    {"name": "B站", "fetcher": fetch_bilibili,
+     "keywords": ["魔形智能", "徐凌杰", "Token超级工厂"], "delay": 2},
+
+    # 搜狗网页搜索
+    {"name": "搜狗搜索", "fetcher": fetch_sogou,
+     "keywords": ["魔形智能", "徐凌杰", "Token超级工厂"], "delay": 2},
+]
 
 
 # ==================== 飞书推送 ====================
 
 
 def build_feishu_card(title: str, link: str, source: str,
-                      matched_keywords: list, pub_time: str, monitor_time: str) -> dict:
+                      matched_keywords: List[str], pub_time: str, monitor_time: str) -> dict:
     """构建飞书富文本卡片消息"""
     keywords_str = "、".join([f"`{kw}`" for kw in matched_keywords])
 
@@ -267,7 +508,7 @@ def build_feishu_card(title: str, link: str, source: str,
                     "tag": "div",
                     "text": {
                         "tag": "lark_md",
-                        "content": f"**发布时间：**{pub_time}"
+                        "content": f"**发布时间：**{pub_time if pub_time else '未知'}"
                     }
                 },
                 {
@@ -357,23 +598,19 @@ def save_history(history: dict):
 def commit_history_to_git():
     """将 history.json 提交回 GitHub 仓库"""
     try:
-        # 配置 git（GitHub Actions 环境需要）
         github_actor = os.environ.get("GITHUB_ACTOR", "github-actions")
         github_repository = os.environ.get("GITHUB_REPOSITORY", "")
 
         os.system(f'git config user.name "{github_actor}"')
         os.system(f'git config user.email "{github_actor}@users.noreply.github.com"')
 
-        # 检查文件是否有变更
         diff_check = os.popen(f"git diff --name-only {HISTORY_FILE}").read().strip()
         if not diff_check:
-            # 也检查新文件
             status_check = os.popen(f"git status --porcelain {HISTORY_FILE}").read().strip()
             if not status_check:
                 logger.info("history.json 无变更，跳过提交")
                 return
 
-        # 添加并提交
         os.system(f"git add {HISTORY_FILE}")
         commit_msg = f"Update history.json - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         exit_code = os.system(f'git commit -m "{commit_msg}"')
@@ -382,7 +619,6 @@ def commit_history_to_git():
             logger.warning("Git commit 失败或无变更")
             return
 
-        # 推送（使用 GITHUB_TOKEN 认证）
         github_token = os.environ.get("GITHUB_TOKEN", "")
         if github_token and github_repository:
             remote_url = f"https://x-access-token:{github_token}@github.com/{github_repository}.git"
@@ -400,11 +636,11 @@ def commit_history_to_git():
 
 def main():
     """主入口函数"""
-    logger.info("=" * 50)
-    logger.info("魔形智能舆情监控启动")
+    logger.info("=" * 60)
+    logger.info("魔形智能舆情监控启动 (混合抓取模式)")
     logger.info(f"监控关键词: {KEYWORDS}")
-    logger.info(f"RSS源数量: {len(RSS_SOURCES)}")
-    logger.info("=" * 50)
+    logger.info(f"数据源: {len(DATA_SOURCES)} 个平台")
+    logger.info("=" * 60)
 
     # 加载历史记录
     history = load_history()
@@ -413,101 +649,115 @@ def main():
     # 当前监控时间
     monitor_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 本次新命中条数
-    new_hits_count = 0
-    push_success_count = 0
-    push_fail_count = 0
+    # 统计数据
+    stats = {
+        "total_checked": 0,
+        "total_fetched": 0,
+        "new_hits": 0,
+        "push_success": 0,
+        "push_fail": 0,
+        "errors": 0,
+    }
 
-    # 遍历所有RSS源
-    for idx, rss_url in enumerate(RSS_SOURCES, 1):
-        logger.info(f"[{idx}/{len(RSS_SOURCES)}] 处理RSS源: {rss_url}")
+    # 遍历所有数据源
+    for source_idx, source_config in enumerate(DATA_SOURCES, 1):
+        source_name = source_config["name"]
+        fetcher = source_config["fetcher"]
+        keywords = source_config["keywords"]
+        delay = source_config.get("delay", 2)
 
-        try:
-            result = fetch_rss_with_fallback(rss_url)
-            if result is None:
-                continue
+        logger.info(f"[{source_idx}/{len(DATA_SOURCES)}] 数据源: {source_name}")
 
-            entries = result["entries"]
-            source_name = result["source_name"]
+        for keyword in keywords:
+            try:
+                items = fetcher(keyword)
+                stats["total_fetched"] += len(items)
 
-            for entry in entries:
-                try:
-                    # 获取标题和摘要
-                    title = entry.get("title", "")
-                    link = entry.get("link", "")
-                    description = entry.get("description", "") or entry.get("summary", "")
-
-                    if not title or not link:
-                        continue
-
-                    # 关键词匹配（标题或摘要）
-                    matched_in_title = find_matched_keywords(title)
-                    matched_in_desc = find_matched_keywords(description)
-                    all_matched = list(set(matched_in_title + matched_in_desc))
-
-                    if not all_matched:
-                        continue
-
-                    # 去重检查
-                    if link in history:
-                        logger.debug(f"已推送过，跳过: {link}")
-                        continue
-
-                    # 解析发布时间
-                    pub_dt = parse_pub_date(entry)
-                    pub_time = format_time(pub_dt)
-
-                    logger.info(f"🎯 命中关键词 {all_matched}: {title}")
-
-                    # 构建飞书卡片并推送
-                    card_data = build_feishu_card(
-                        title=title,
-                        link=link,
-                        source=source_name,
-                        matched_keywords=all_matched,
-                        pub_time=pub_time,
-                        monitor_time=monitor_time,
-                    )
-
-                    if send_feishu(card_data):
-                        push_success_count += 1
-                        # 记录到历史
-                        history[link] = {
-                            "title": title,
-                            "time": monitor_time,
-                            "source": source_name,
-                            "keywords": all_matched,
-                        }
-                        new_hits_count += 1
-                    else:
-                        push_fail_count += 1
-
-                    # 避免推送过快，短暂休眠
-                    time.sleep(0.5)
-
-                except Exception as e:
-                    logger.error(f"处理单条RSS条目异常: {e}")
+                if not items:
                     continue
 
-        except Exception as e:
-            logger.error(f"处理RSS源异常: {rss_url} - {e}")
-            continue
+                for item in items:
+                    try:
+                        title = item.get("title", "")
+                        url = item.get("url", "")
+                        summary = item.get("summary", "")
+                        source = item.get("source", source_name)
+                        pub_time = item.get("pub_time", "")
+
+                        if not title or not url:
+                            continue
+
+                        stats["total_checked"] += 1
+
+                        # 关键词匹配（标题或摘要）
+                        matched_in_title = find_matched_keywords(title)
+                        matched_in_desc = find_matched_keywords(summary)
+                        all_matched = list(set(matched_in_title + matched_in_desc))
+
+                        if not all_matched:
+                            continue
+
+                        # 去重检查
+                        key = dedup_key(url, title)
+                        if key in history:
+                            continue
+
+                        logger.info(f"🎯 [{source}] 命中 {all_matched}: {title[:60]}")
+
+                        # 构建飞书卡片并推送
+                        card_data = build_feishu_card(
+                            title=title,
+                            link=url,
+                            source=source,
+                            matched_keywords=all_matched,
+                            pub_time=pub_time,
+                            monitor_time=monitor_time,
+                        )
+
+                        if send_feishu(card_data):
+                            stats["push_success"] += 1
+                            history[key] = {
+                                "title": title,
+                                "url": url,
+                                "time": monitor_time,
+                                "source": source,
+                                "keywords": all_matched,
+                            }
+                            stats["new_hits"] += 1
+                        else:
+                            stats["push_fail"] += 1
+
+                        time.sleep(0.5)
+
+                    except Exception as e:
+                        logger.error(f"处理单条内容异常: {e}")
+                        continue
+
+                # 关键词之间延迟
+                time.sleep(delay)
+
+            except Exception as e:
+                logger.error(f"数据源异常 [{source_name}/{keyword}]: {e}")
+                stats["errors"] += 1
+                continue
+
+        # 数据源之间延迟
+        time.sleep(delay)
 
     # 保存历史记录
     save_history(history)
 
-    # Git提交（GitHub Actions环境）
+    # Git提交
     if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
         commit_history_to_git()
 
     # 统计报告
-    logger.info("=" * 50)
+    logger.info("=" * 60)
     logger.info("监控运行完成")
-    logger.info(f"本次新命中: {new_hits_count} 条")
-    logger.info(f"推送成功: {push_success_count} 条")
-    logger.info(f"推送失败: {push_fail_count} 条")
+    logger.info(f"总检查: {stats['total_checked']} | 新命中: {stats['new_hits']} | "
+                f"推送成功: {stats['push_success']} | 失败: {stats['push_fail']} | 错误: {stats['errors']}")
     logger.info(f"历史记录总计: {len(history)} 条")
-    logger.info("=" * 50)
+    logger.info("=" * 60)
 
     return 0
 
