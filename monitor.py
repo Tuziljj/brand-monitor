@@ -122,6 +122,31 @@ def http_get(url: str, params: dict = None, extra_headers: dict = None,
 # ==================== 数据源抓取函数 ====================
 
 
+def _extract_baidu_sdata(div) -> Dict[str, str]:
+    """从百度结果div的s-data注释中提取JSON数据"""
+    try:
+        # 从div的原始HTML中提取（避免BeautifulSoup解析<em>标签破坏JSON）
+        div_html = str(div)
+        json_match = re.search(r's-data:\s*({.+?})\s*-->', div_html, re.DOTALL)
+        if not json_match:
+            json_match = re.search(r's-data:\s*({.+})', div_html, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(1)
+            # 移除HTML标签（如<em>）
+            json_str = re.sub(r'</?[a-zA-Z][^>]*>', '', json_str)
+            data = json.loads(json_str)
+            return {
+                "source_name": data.get("sourceName", ""),
+                "disp_time": data.get("dispTime", ""),
+                "title": data.get("title", ""),
+                "url": data.get("titleUrl", ""),
+                "summary": data.get("summary", ""),
+            }
+    except Exception:
+        pass
+    return {}
+
+
 def fetch_baidu_news(keyword: str) -> List[Dict]:
     """
     抓取百度新闻搜索结果
@@ -169,22 +194,23 @@ def fetch_baidu_news(keyword: str) -> List[Dict]:
             summary_tag = div.select_one('.content-right_8Zs40, .c-color-text, .content-right')
             summary = clean_html(summary_tag.get_text(strip=True)) if summary_tag else ''
 
-            source_tag = div.select_one('.c-color-gray, .c-gap-right')
-            source_info = source_tag.get_text(strip=True) if source_tag else ''
+            # 从s-data注释中提取来源名和发布时间
+            sdata = _extract_baidu_sdata(div)
+            source_name = sdata.get("source_name", "")
+            pub_time = sdata.get("disp_time", "")
 
-            # 提取来源名
-            source_name = "百度新闻"
-            if '·' in source_info:
-                parts = source_info.split('·')
-                if len(parts) >= 2:
-                    source_name = parts[0].strip()
+            # 备用：从span.c-color-gray提取来源名（仅来源名，不含时间）
+            if not source_name:
+                source_tag = div.select_one('.c-color-gray, .c-gap-right')
+                if source_tag:
+                    source_name = source_tag.get_text(strip=True)
 
             results.append({
                 "title": title,
                 "url": href if href.startswith('http') else f"https://www.baidu.com{href}",
                 "summary": summary,
                 "source": source_name or "百度新闻",
-                "pub_time": source_info,
+                "pub_time": pub_time,
                 "keyword": keyword,
             })
         except Exception as e:
@@ -237,15 +263,27 @@ def fetch_baidu_web(keyword: str) -> List[Dict]:
             abstract_tag = div.select_one('.c-abstract, .content-right_8Zs40, .c-color-text')
             summary = clean_html(abstract_tag.get_text(strip=True)) if abstract_tag else ''
 
+            # 提取发布时间：span[class*="prefix-time_"] 包含日期
+            pub_time = ""
+            time_tag = div.select_one('span[class*="prefix-time"]')
+            if time_tag:
+                pub_time = time_tag.get_text(strip=True)
+
+            # 提取来源：cite标签
+            source_name = "百度搜索"
             cite_tag = div.select_one('cite, .c-showurl')
-            show_url = cite_tag.get_text(strip=True) if cite_tag else ''
+            if cite_tag:
+                cite_text = cite_tag.get_text(strip=True)
+                # cite通常是URL，取域名部分作为来源
+                if cite_text and not cite_text.startswith('http'):
+                    source_name = f"百度搜索-{cite_text[:30]}"
 
             results.append({
                 "title": title,
                 "url": href if href.startswith('http') else f"https://www.baidu.com{href}",
                 "summary": summary,
-                "source": "百度搜索",
-                "pub_time": show_url,
+                "source": source_name,
+                "pub_time": pub_time,
                 "keyword": keyword,
             })
         except Exception as e:
@@ -294,18 +332,20 @@ def fetch_wechat_sogou(keyword: str) -> List[Dict]:
             source_tag = item.select_one('.account, .s-p a')
             account = source_tag.get_text(strip=True) if source_tag else ''
 
-            # 时间
-            time_tag = item.select_one('.s2 script, .time, .s-p')
+            # 时间：在.s-p区域内的script标签中
             pub_time = ''
-            if time_tag:
-                time_text = str(time_tag.string or '')
-                time_match = re.search(r"timeConvert\('(\d+)'\)", time_text)
-                if time_match:
-                    try:
-                        ts = int(time_match.group(1))
-                        pub_time = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-                    except (ValueError, OSError):
-                        pass
+            sp_tag = item.select_one('.s-p')
+            if sp_tag:
+                script = sp_tag.find('script')
+                if script:
+                    time_text = str(script.string or '')
+                    time_match = re.search(r"timeConvert\('(\d+)'\)", time_text)
+                    if time_match:
+                        try:
+                            ts = int(time_match.group(1))
+                            pub_time = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+                        except (ValueError, OSError):
+                            pass
 
             results.append({
                 "title": title,
@@ -412,15 +452,37 @@ def fetch_sogou(keyword: str) -> List[Dict]:
             summary_tag = item.select_one('.str-text, .vr-brief, .abstract')
             summary = clean_html(summary_tag.get_text(strip=True)) if summary_tag else ''
 
+            # 提取发布时间：span.cite-date 或包含日期的span
+            pub_time = ""
+            cite_date = item.select_one('span.cite-date')
+            if cite_date:
+                pub_time = cite_date.get_text(strip=True)
+            else:
+                # 备用：查找包含日期格式的span
+                for sp in item.find_all('span'):
+                    txt = sp.get_text(strip=True)
+                    if re.match(r'\d{4}[-/年]\d{1,2}[-/月]', txt):
+                        pub_time = txt
+                        break
+            # 清理时间中的噪音
+            pub_time = pub_time.lstrip('-').strip()
+
+            # 提取来源：cite标签（取域名部分，避免混入时间）
+            source_name = "搜狗搜索"
             cite_tag = item.select_one('.citeurl, cite')
-            cite = cite_tag.get_text(strip=True) if cite_tag else ''
+            if cite_tag:
+                cite_text = cite_tag.get_text(strip=True)
+                # 移除时间部分，只保留URL/域名
+                cite_text = re.split(r'\s*[-–]\s*\d{4}', cite_text)[0]
+                if cite_text and len(cite_text) < 40:
+                    source_name = f"搜狗搜索-{cite_text[:25]}"
 
             results.append({
                 "title": title,
                 "url": href if href.startswith('http') else f"https://www.sogou.com{href}",
                 "summary": summary,
-                "source": "搜狗搜索",
-                "pub_time": cite,
+                "source": source_name,
+                "pub_time": pub_time,
                 "keyword": keyword,
             })
         except Exception as e:
