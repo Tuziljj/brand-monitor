@@ -1,16 +1,8 @@
 name: 魔形智能舆情监控
 
 on:
-  # 每30分钟运行一次（UTC时间）
-  schedule:
-    - cron: '*/30 * * * *'
-
-  # 允许手动触发
+  # 不再用 GitHub 的 schedule，改用外部 cron-job.org 触发
   workflow_dispatch:
-
-  # 可选：push到main分支时也运行（方便调试）
-  # push:
-  #   branches: [ main ]
 
 permissions:
   contents: write
