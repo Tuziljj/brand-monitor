@@ -112,10 +112,14 @@ def normalize_url(url: str) -> str:
     return url
 
 
-def dedup_key(url: str, title: str) -> str:
+def dedup_key(url: str, title: str, source: str = "") -> str:
     """生成去重key - 使用规范化后的URL避免跟踪参数差异"""
-    clean = normalize_url(url)
-    key = f"{clean}|{title[:40]}"
+    # 搜狗搜索的中间跳转链接每次随机不同，使用 来源+标题 做去重
+    if 'sogou.com/link?' in url:
+        key = f"SOGOU|{source}|{title[:60]}"
+    else:
+        clean = normalize_url(url)
+        key = f"{clean}|{title[:40]}"
     return hashlib.md5(key.encode()).hexdigest()
 
 
@@ -243,9 +247,14 @@ def fetch_baidu_news(keyword: str) -> List[Dict]:
                 if source_tag:
                     source_name = source_tag.get_text(strip=True)
 
+            # 使用mu属性（真实目标URL）代替百度中间跳转链接，确保去重稳定
+            real_url = div.get('mu', '')
+            if not real_url:
+                real_url = href if href.startswith('http') else f"https://www.baidu.com{href}"
+
             results.append({
                 "title": title,
-                "url": href if href.startswith('http') else f"https://www.baidu.com{href}",
+                "url": real_url,
                 "summary": summary,
                 "source": source_name or "百度新闻",
                 "pub_time": pub_time,
@@ -316,9 +325,14 @@ def fetch_baidu_web(keyword: str) -> List[Dict]:
                 if cite_text and not cite_text.startswith('http'):
                     source_name = f"百度搜索-{cite_text[:30]}"
 
+            # 使用mu属性（真实目标URL）代替百度中间跳转链接
+            real_url = div.get('mu', '')
+            if not real_url:
+                real_url = href if href.startswith('http') else f"https://www.baidu.com{href}"
+
             results.append({
                 "title": title,
-                "url": href if href.startswith('http') else f"https://www.baidu.com{href}",
+                "url": real_url,
                 "summary": summary,
                 "source": source_name,
                 "pub_time": pub_time,
@@ -860,7 +874,7 @@ def main():
                             continue
 
                         # 去重检查
-                        key = dedup_key(url, title)
+                        key = dedup_key(url, title, source)
                         if key in history:
                             stats["skipped_dup"] = stats.get("skipped_dup", 0) + 1
                             logger.info(f"⏭️ 已推送跳过: {title[:40]}...")
