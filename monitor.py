@@ -87,6 +87,20 @@ def normalize_url(url: str) -> str:
     if not url:
         return ""
 
+    # 微信公众号链接：保留核心标识参数，去除动态签名参数
+    if 'mp.weixin.qq.com' in url or 'weixin.qq.com' in url:
+        # 提取 ? 前的路径
+        base = url.split('?')[0] if '?' in url else url
+        # 保留 sn 和 __biz 参数（文章唯一标识）
+        preserved = []
+        for param in ['sn', '__biz', 'mid', 'idx', 'chksm']:
+            m = re.search(rf'[?&]({param}=[^&]*)', url)
+            if m:
+                preserved.append(m.group(1))
+        if preserved:
+            return base + '?' + '&'.join(preserved)
+        return base
+
     # 去除常见跟踪参数（涵盖百度、搜狗、微信等平台的统计参数）
     tracking_params = [
         # UTM 系列
@@ -96,6 +110,8 @@ def normalize_url(url: str) -> str:
         'wfr', 'spider', 'for', 'tn', 'rn', 'ie', 'wd',
         # 搜狗系
         'token', 'type', 'query',
+        # 微信/公众号动态参数（时间戳、签名等）
+        'src', 'tamp', 'ver', 'signature', 'new',
         # 通用
         'track_id', 'share_source', 'share_medium',
     ]
