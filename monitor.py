@@ -561,6 +561,151 @@ def fetch_sogou(keyword: str) -> List[Dict]:
     return results
 
 
+def fetch_toutiao(keyword: str) -> List[Dict]:
+    """
+    抓取今日头条搜索结果
+    URL: https://so.toutiao.com/search?keyword=KEYWORD&pd=information
+    """
+    resp = http_get(
+        "https://so.toutiao.com/search",
+        params={"keyword": keyword, "pd": "information"},
+        extra_headers={"Referer": "https://www.toutiao.com/"},
+    )
+    if not resp or resp.status_code != 200 or len(resp.text) < 10000:
+        return []
+
+    results = []
+
+    # 方法1: 提取所有 article_url，然后反向匹配对应标题
+    article_urls = re.findall(r'"article_url":"([^"]+)"', resp.text)
+    for url in set(article_urls):
+        try:
+            if not url.startswith('http'):
+                continue
+            # 在该article_url附近查找对应的title
+            # 用article_url前面的内容匹配title
+            pattern = re.search(
+                r'"title":"([^"]*?)"[^}]*?"article_url":"' + re.escape(url) + r'"',
+                resp.text,
+            )
+            if not pattern:
+                # 反向匹配：article_url在title前面
+                pattern = re.search(
+                    r'"article_url":"' + re.escape(url) + r'"[^}]*?"title":"([^"]*?)"',
+                    resp.text,
+                )
+            title = clean_html(pattern.group(1)) if pattern else ""
+            # 如果找不到标题，从URL推断
+            if not title:
+                continue
+            # 去除HTML标签残留
+            title = title.replace('\u003cem\u003e', '').replace('\u003c/em\u003e', '')
+            # 清理跟踪参数
+            clean_url = normalize_url(url)
+            results.append({
+                "title": title,
+                "url": clean_url,
+                "summary": "",
+                "source": "今日头条",
+                "pub_time": "",
+                "keyword": keyword,
+            })
+        except Exception as e:
+            logger.debug(f"解析头条条目异常: {e}")
+            continue
+
+    # 去重
+    seen = set()
+    unique = []
+    for r in results:
+        if r["url"] not in seen:
+            seen.add(r["url"])
+            unique.append(r)
+
+    logger.info(f"[今日头条] '{keyword}' 获取 {len(unique)} 条")
+    return unique
+
+
+def fetch_google_news(keyword: str) -> List[Dict]:
+    """
+    抓取Google News RSS搜索结果
+    依赖: feedparser (已在requirements.txt中)
+    注意: 需要在国外网络环境（GitHub Actions服务器在国外，可正常访问）
+    URL: https://news.google.com/rss/search?q=KEYWORD&hl=zh-CN
+    """
+    try:
+        import feedparser
+    except ImportError:
+        logger.warning("[Google News] feedparser 未安装，跳过")
+        return []
+
+    encoded_kw = requests.utils.quote(keyword)
+    rss_url = (
+        f"https://news.google.com/rss/search?q={encoded_kw}"
+        f"&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+    )
+
+    try:
+        feed = feedparser.parse(
+            rss_url,
+            request_headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/rss+xml, application/xml, text/xml",
+            },
+        )
+
+        if hasattr(feed, 'bozo') and feed.bozo and not feed.entries:
+            logger.warning(f"[Google News] RSS解析失败: {feed.bozo_exception}")
+            return []
+
+        results = []
+        for entry in feed.entries:
+            try:
+                title = clean_html(entry.get("title", ""))
+                link = entry.get("link", "")
+                if not title or not link:
+                    continue
+
+                # 发布时间
+                pub_time = ""
+                for field in ["published_parsed", "updated_parsed"]:
+                    parsed = getattr(entry, field, None)
+                    if parsed:
+                        try:
+                            pub_time = datetime(*parsed[:6]).strftime("%Y-%m-%d %H:%M:%S")
+                        except (TypeError, ValueError):
+                            continue
+                        break
+                if not pub_time:
+                    pub_time = entry.get("published", "")
+
+                # 来源
+                source_name = "Google News"
+                if hasattr(entry, "source") and entry.source:
+                    source_title = getattr(entry.source, "title", "")
+                    if source_title:
+                        source_name = f"Google News-{source_title}"
+
+                results.append({
+                    "title": title,
+                    "url": link,
+                    "summary": clean_html(entry.get("summary", "")),
+                    "source": source_name,
+                    "pub_time": pub_time,
+                    "keyword": keyword,
+                })
+            except Exception as e:
+                logger.debug(f"解析Google News条目异常: {e}")
+                continue
+
+        logger.info(f"[Google News] '{keyword}' 获取 {len(results)} 条")
+        return results
+
+    except Exception as e:
+        logger.warning(f"[Google News] 请求异常: {e}")
+        return []
+
+
 # ==================== 数据源注册表 ====================
 
 # 数据源配置：名称、抓取函数、要搜索的关键词列表
@@ -584,6 +729,14 @@ DATA_SOURCES = [
     # 搜狗网页搜索
     {"name": "搜狗搜索", "fetcher": fetch_sogou,
      "keywords": ["魔形智能", "徐凌杰", "Token超级工厂"], "delay": 2},
+
+    # 今日头条搜索
+    {"name": "今日头条", "fetcher": fetch_toutiao,
+     "keywords": ["魔形智能", "徐凌杰", "Token超级工厂"], "delay": 2},
+
+    # Google News RSS（GitHub Actions国外服务器可正常访问）
+    {"name": "Google News", "fetcher": fetch_google_news,
+     "keywords": ["魔形智能", "Token超级工厂"], "delay": 2},
 ]
 
 
