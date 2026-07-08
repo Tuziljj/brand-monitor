@@ -15,7 +15,9 @@ import time
 import hashlib
 import logging
 import requests
+import subprocess
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from urllib.parse import quote, unquote, urljoin
 from typing import Optional, List, Dict, Any
 
@@ -80,10 +82,46 @@ def find_matched_keywords(text: str) -> List[str]:
     return matched
 
 
+def normalize_url(url: str) -> str:
+    """标准化URL - 去除跟踪参数，避免同一文章因参数不同导致去重失效"""
+    if not url:
+        return ""
+
+    # 去除常见跟踪参数（涵盖百度、搜狗、微信等平台的统计参数）
+    tracking_params = [
+        # UTM 系列
+        'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+        # 百度系
+        'fr', 'from', 'ref', 'source', 'ssid', 'bd_page_type', 'ald',
+        'wfr', 'spider', 'for', 'tn', 'rn', 'ie', 'wd',
+        # 搜狗系
+        'token', 'type', 'query',
+        # 通用
+        'track_id', 'share_source', 'share_medium',
+    ]
+    pattern = r'[?&](?:' + '|'.join(tracking_params) + r')=[^&]*'
+    url = re.sub(pattern, '', url)
+
+    # 去除末尾的空 ? 或 &
+    url = re.sub(r'[?&]$', '', url)
+    # 清理连续的 && 变成 &
+    url = re.sub(r'&{2,}', '&', url)
+    # 清理 ?& 变成 ?
+    url = re.sub(r'\?&', '?', url)
+
+    return url
+
+
 def dedup_key(url: str, title: str) -> str:
-    """生成去重key"""
-    key = f"{url}|{title[:40]}"
+    """生成去重key - 使用规范化后的URL避免跟踪参数差异"""
+    clean = normalize_url(url)
+    key = f"{clean}|{title[:40]}"
     return hashlib.md5(key.encode()).hexdigest()
+
+
+def now_beijing() -> datetime:
+    """获取东八区（北京时间）当前时间"""
+    return datetime.now(ZoneInfo("Asia/Shanghai"))
 
 
 def format_pub_time(ts: Any) -> str:
@@ -640,10 +678,20 @@ def load_history() -> dict:
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                content = f.read().strip()
+                if not content:
+                    logger.info(f"{HISTORY_FILE} 为空文件")
+                    return {}
+                data = json.loads(content)
+                if not isinstance(data, dict):
+                    logger.warning(f"{HISTORY_FILE} 格式异常，将重置")
+                    return {}
+                logger.info(f"历史记录加载成功: {len(data)} 条")
+                return data
         except (json.JSONDecodeError, IOError) as e:
             logger.warning(f"历史记录文件读取失败，将创建新文件: {e}")
             return {}
+    logger.info(f"{HISTORY_FILE} 不存在，将创建新文件")
     return {}
 
 
@@ -657,40 +705,86 @@ def save_history(history: dict):
         logger.error(f"历史记录保存失败: {e}")
 
 
+def _git_cmd(args: list, check: bool = False) -> subprocess.CompletedProcess:
+    """执行 git 命令，返回结果"""
+    return subprocess.run(
+        ["git"] + args,
+        capture_output=True,
+        text=True,
+        cwd=os.getcwd(),
+    )
+
+
 def commit_history_to_git():
     """将 history.json 提交回 GitHub 仓库"""
     try:
-        github_actor = os.environ.get("GITHUB_ACTOR", "github-actions")
-        github_repository = os.environ.get("GITHUB_REPOSITORY", "")
-
-        os.system(f'git config user.name "{github_actor}"')
-        os.system(f'git config user.email "{github_actor}@users.noreply.github.com"')
-
-        diff_check = os.popen(f"git diff --name-only {HISTORY_FILE}").read().strip()
-        if not diff_check:
-            status_check = os.popen(f"git status --porcelain {HISTORY_FILE}").read().strip()
-            if not status_check:
-                logger.info("history.json 无变更，跳过提交")
-                return
-
-        os.system(f"git add {HISTORY_FILE}")
-        commit_msg = f"Update history.json - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        exit_code = os.system(f'git commit -m "{commit_msg}"')
-
-        if exit_code != 0:
-            logger.warning("Git commit 失败或无变更")
+        is_actions = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+        if not is_actions:
+            logger.info("非 GitHub Actions 环境，跳过 git 提交")
             return
 
+        github_actor = os.environ.get("GITHUB_ACTOR", "github-actions")
+        github_repository = os.environ.get("GITHUB_REPOSITORY", "")
         github_token = os.environ.get("GITHUB_TOKEN", "")
-        if github_token and github_repository:
-            remote_url = f"https://x-access-token:{github_token}@github.com/{github_repository}.git"
-            os.system(f"git push {remote_url} HEAD:$(git rev-parse --abbrev-ref HEAD)")
-            logger.info("history.json 已成功提交到 GitHub")
+        github_ref = os.environ.get("GITHUB_REF_NAME", "main")
+
+        if not github_token or not github_repository:
+            logger.warning("GITHUB_TOKEN 或 GITHUB_REPOSITORY 未设置，跳过 git 提交")
+            return
+
+        logger.info("开始将 history.json 提交到 GitHub 仓库...")
+
+        # 配置 git 用户
+        _git_cmd(["config", "user.name", github_actor])
+        _git_cmd(["config", "user.email", f"{github_actor}@users.noreply.github.com"])
+
+        # 检查文件是否有变更
+        result_diff = _git_cmd(["diff", "--name-only", HISTORY_FILE])
+        has_diff = result_diff.returncode == 0 and HISTORY_FILE in result_diff.stdout
+
+        result_status = _git_cmd(["status", "--porcelain", HISTORY_FILE])
+        has_new = result_status.returncode == 0 and HISTORY_FILE in result_status.stdout
+
+        logger.info(f"Git diff 检测: has_diff={has_diff}, has_new={has_new}")
+        logger.debug(f"Git diff stdout: {result_diff.stdout.strip()}")
+        logger.debug(f"Git status stdout: {result_status.stdout.strip()}")
+
+        if not has_diff and not has_new:
+            logger.info("history.json 无变更，跳过提交")
+            return
+
+        # git add
+        add_result = _git_cmd(["add", HISTORY_FILE])
+        if add_result.returncode != 0:
+            logger.error(f"Git add 失败: {add_result.stderr}")
+            return
+        logger.info("Git add 成功")
+
+        # git commit
+        commit_msg = f"Update history.json - {now_beijing().strftime('%Y-%m-%d %H:%M:%S')}"
+        commit_result = _git_cmd(["commit", "-m", commit_msg])
+        if commit_result.returncode != 0:
+            logger.error(f"Git commit 失败: {commit_result.stderr}")
+            return
+        logger.info(f"Git commit 成功: {commit_msg}")
+
+        # git push
+        remote_url = f"https://x-access-token:{github_token}@github.com/{github_repository}.git"
+        push_result = subprocess.run(
+            ["git", "push", remote_url, f"HEAD:{github_ref}"],
+            capture_output=True,
+            text=True,
+            cwd=os.getcwd(),
+        )
+
+        if push_result.returncode == 0:
+            logger.info(f"history.json 已成功推送到 GitHub ({github_ref})")
         else:
-            logger.warning("GITHUB_TOKEN 或 GITHUB_REPOSITORY 未设置，跳过自动推送")
+            logger.error(f"Git push 失败 (code={push_result.returncode}): {push_result.stderr}")
+            logger.error(f"Git push stdout: {push_result.stdout}")
 
     except Exception as e:
-        logger.error(f"Git 提交失败: {e}")
+        logger.error(f"Git 提交异常: {e}", exc_info=True)
 
 
 # ==================== 主程序 ====================
@@ -707,9 +801,15 @@ def main():
     # 加载历史记录
     history = load_history()
     logger.info(f"已加载历史记录: {len(history)} 条")
+    if history:
+        # 打印前3条历史记录的key前缀，用于排查去重问题
+        sample_keys = list(history.keys())[:3]
+        for k in sample_keys:
+            entry = history[k]
+            logger.debug(f"History sample: {k[:16]}... -> {entry.get('title', '')[:40]}")
 
     # 当前监控时间
-    monitor_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    monitor_time = now_beijing().strftime("%Y-%m-%d %H:%M:%S")
 
     # 统计数据
     stats = {
@@ -762,6 +862,8 @@ def main():
                         # 去重检查
                         key = dedup_key(url, title)
                         if key in history:
+                            stats["skipped_dup"] = stats.get("skipped_dup", 0) + 1
+                            logger.info(f"⏭️ 已推送跳过: {title[:40]}...")
                             continue
 
                         logger.info(f"🎯 [{source}] 命中 {all_matched}: {title[:60]}")
@@ -814,10 +916,12 @@ def main():
         commit_history_to_git()
 
     # 统计报告
+    skipped = stats.get("skipped_dup", 0)
     logger.info("=" * 60)
     logger.info("监控运行完成")
     logger.info(f"总检查: {stats['total_checked']} | 新命中: {stats['new_hits']} | "
-                f"推送成功: {stats['push_success']} | 失败: {stats['push_fail']} | 错误: {stats['errors']}")
+                f"去重跳过: {skipped} | 推送成功: {stats['push_success']} | "
+                f"失败: {stats['push_fail']} | 错误: {stats['errors']}")
     logger.info(f"历史记录总计: {len(history)} 条")
     logger.info("=" * 60)
 
