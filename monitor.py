@@ -112,6 +112,8 @@ def normalize_url(url: str) -> str:
         'token', 'type', 'query',
         # 微信/公众号动态参数（时间戳、签名等）
         'src', 'tamp', 'ver', 'signature', 'new',
+        # 头条系
+        'upstream_biz', 'tt_from', 'tt_group_id', 'is_hit',
         # 通用
         'track_id', 'share_source', 'share_medium',
     ]
@@ -561,6 +563,38 @@ def fetch_sogou(keyword: str) -> List[Dict]:
     return results
 
 
+def _normalize_toutiao_url(url: str) -> str:
+    """
+    规范化头条URL：
+    1. 将 group/xxx 转换为 article/xxx（避免PC端跳转App下载页）
+    2. 从短链接中提取 h5_url 参数的真实目标URL
+    3. 去除所有跟踪参数
+    4. 统一为 www.toutiao.com/article/ID 格式（去重稳定）
+    """
+    if not url:
+        return ""
+
+    # 短链接（article.zlink.toutiao.com）中常包含 h5_url 参数指向真实URL
+    if 'zlink.toutiao.com' in url or 'toutiaoimg.com' in url:
+        h5_match = re.search(r'[?&]h5_url=(https?%3A%2F%2F[^&]+)', url)
+        if h5_match:
+            import urllib.parse
+            real_url = urllib.parse.unquote(h5_match.group(1))
+            # 递归处理提取出的URL
+            return _normalize_toutiao_url(real_url)
+        # 没有h5_url则直接清理参数
+        return normalize_url(url)
+
+    # 提取文章ID（group/ID、article/ID、i/ID 等格式）
+    m = re.search(r'/(?:group|article|i)/(\d+)', url)
+    if m:
+        article_id = m.group(1)
+        return f"https://www.toutiao.com/article/{article_id}/"
+
+    # 兜底：直接清理参数
+    return normalize_url(url)
+
+
 def fetch_toutiao(keyword: str) -> List[Dict]:
     """
     抓取今日头条搜索结果
@@ -600,8 +634,8 @@ def fetch_toutiao(keyword: str) -> List[Dict]:
                 continue
             # 去除HTML标签残留
             title = title.replace('\u003cem\u003e', '').replace('\u003c/em\u003e', '')
-            # 清理跟踪参数
-            clean_url = normalize_url(url)
+            # 规范化头条URL：group/xxx -> article/xxx，去除跟踪参数
+            clean_url = _normalize_toutiao_url(url)
             results.append({
                 "title": title,
                 "url": clean_url,
@@ -614,7 +648,7 @@ def fetch_toutiao(keyword: str) -> List[Dict]:
             logger.debug(f"解析头条条目异常: {e}")
             continue
 
-    # 去重
+    # 去重（基于规范化后的URL）
     seen = set()
     unique = []
     for r in results:
